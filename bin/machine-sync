@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+#
+# machine-sync — keep two Macs in lockstep when switching between them.
+#
+#   machine-sync in              Arrival ritual: pull everything, surface drift & stranded work.
+#   machine-sync out             Departure ritual: push where allowed; package read-only org work as a changeset for a reviewer.
+#   machine-sync status          Read-only health check (no mutations, no prompts).
+#   machine-sync doctor          Verify required tooling + repos are bootstrapped on this machine.
+#   machine-sync package <br>    Emit ONE self-contained <slug>-changeset.md (handoff for read-only org repos).
+#
+# Design: git is the source of truth for code. This tool enforces push-before-you-leave
+# discipline and handles the things git does NOT carry across machines:
+#   - secrets (.env) materialized from 1Password via `op inject` on a committed .env.tpl
+#   - dotfiles (~/.zshrc, ~/.gitconfig, ~/.claude/settings.json) via a tracked dotfiles repo
+#   - tool versions (node, npm) checked against a pinned manifest
+#   - worktree + cron parity reports
+#   - handoff packaging: read-only org repos (where your account cannot push or open PRs) are
+#     delivered to the maintainer as ONE markdown changeset their agent can re-apply — no PR/patch/bundle.
+#
+# Never prints secret VALUES. Never force-pushes. Always prompts before mutating remotes.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Config (override via env)
+# ---------------------------------------------------------------------------
+GH_DIR="${MACHINE_SYNC_GH_DIR:-$HOME/Documents/GitHub}"
+DOTFILES_DIR="${MACHINE_SYNC_DOTFILES_DIR:-$HOME/.dotfiles}"
+TPL_DIR="${MACHINE_SYNC_TPL_DIR:-$DOTFILES_DIR/env-templates}"
+VERSION_LOCK="${MACHINE_SYNC_VERSION_LOCK:-$DOTFILES_DIR/env-manifest/versions.lock}"
+CRON_TRACKED="${MACHINE_SYNC_CRON:-$DOTFILES_DIR/cron/crontab.txt}"
+OUTBOX_DIR="${MACHINE_SYNC_OUTBOX:-$DOTFILES_DIR/outbox}"
+OUTBOX_PRUNE_DAYS="${MACHINE_SYNC_OUTBOX_PRUNE_DAYS:-14}"
+DEFAULT_BASE="${MACHINE_SYNC_BASE:-origin/main}"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; X=$'\033[0m'
+else
+  R=""; G=""; Y=""; B=""; DIM=""; BOLD=""; X=""
+fi
+WARN_COUNT=0
+ok()    { printf "  ${G}✓${X} %s\n" "$1"; }
+warn()  { printf "  ${Y}!${X} %s\n" "$1"; WARN_COUNT=$((WARN_COUNT+1)); }
+bad()   { printf "  ${R}✗${X} %s\n" "$1"; WARN_COUNT=$((WARN_COUNT+1)); }
+info()  { printf "  ${DIM}%s${X}\n" "$1"; }
+hdr()   { printf "\n${BOLD}${B}== %s ==${X}\n" "$1"; }
+ask()   { # ask "prompt" -> returns 0 on yes
+  local reply; printf "  ${Y}?${X} %s [y/N] " "$1"; read -r reply </dev/tty 2>/dev/null || return 1
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+list_repos() {
+  local d
+  for d in "$GH_DIR"/*/; do
+    [ -d "${d}.git" ] && printf '%s\n' "${d%/}"
+  done
+}
+
+slugify() { printf '%s' "$1" | tr '/' '-' | tr -cs 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//'; }
+
+repo_origin_slug() { # $1=repo abs -> "org/repo" (empty if no github origin)
+  git -C "$1" remote get-url origin 2>/dev/null \
+    | sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##'
+}
+
+repo_push_access() { # $1=repo abs -> true | false | unknown
+  local slug; slug="$(repo_origin_slug "$1")"
+  { [ -z "$slug" ] || ! have gh; } && { echo unknown; return; }
+  case "$(gh api "repos/$slug" --jq '.permissions.push' 2>/dev/null)" in
+    true)  echo true ;;
+    false) echo false ;;
+    *)     echo unknown ;;
+  esac
+}
+
+outbox_prune() { # drop changeset dirs older than the retention window
+  [ -d "$OUTBOX_DIR" ] || return 0
+  find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$OUTBOX_PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# doctor — is this machine bootstrapped?
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  hdr "Tooling"
+  for t in git gh op node npm; do
+    if have "$t"; then ok "$t ($(command -v "$t"))"; else bad "$t missing — see BOOTSTRAP.md"; fi
+  done
+
+  hdr "Repos"
+  local n=0
+  while IFS= read -r r; do n=$((n+1)); ok "$(basename "$r")"; done < <(list_repos)
+  [ "$n" -eq 0 ] && bad "no repos under $GH_DIR"
+
+  hdr "Secrets (1Password)"
+  if have op; then
+    if op whoami >/dev/null 2>&1; then ok "op CLI signed in ($(op whoami 2>/dev/null | head -1))"
+    else warn "op CLI installed but not signed in (1Password app → Settings → Developer → 'Integrate with CLI', or: eval \$(op signin))"; fi
+  else
+    bad "op CLI missing (brew install --cask 1password-cli)"
+  fi
+  local tpls=0 r
+  while IFS= read -r r; do [ -f "$TPL_DIR/$(basename "$r").env.tpl" ] && tpls=$((tpls+1)); done < <(list_repos)
+  [ "$tpls" -gt 0 ] && ok "$tpls repo(s) have a template in $TPL_DIR" || warn "no env templates scaffolded yet — see BOOTSTRAP.md"
+
+  hdr "Dotfiles repo"
+  [ -d "$DOTFILES_DIR/.git" ] && ok "$DOTFILES_DIR tracked" || warn "$DOTFILES_DIR not a git repo yet (git init + add remote)"
+
+  hdr "Handoff outbox"
+  if [ -d "$OUTBOX_DIR" ]; then
+    local pend; pend="$(find "$OUTBOX_DIR" -name '*-changeset.md' 2>/dev/null | wc -l | tr -d ' ')"
+    [ "$pend" -gt 0 ] && info "$pend changeset(s) in $OUTBOX_DIR (auto-pruned after ${OUTBOX_PRUNE_DAYS}d)" || ok "outbox empty"
+  else
+    ok "outbox not yet created (made on first package)"
+  fi
+
+  summary
+}
+
+# ---------------------------------------------------------------------------
+# Per-repo git state
+# ---------------------------------------------------------------------------
+repo_report() { # $1=repo path, $2=mode(in|out|status)
+  local repo="$1" mode="$2" name
+  name="$(basename "$repo")"
+  cd "$repo" || { bad "$name: cannot cd"; return; }
+
+  git fetch --all --prune --quiet 2>/dev/null
+
+  local branch ahead behind dirty unpushed
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+
+  # ahead/behind vs upstream (if tracking)
+  ahead=0; behind=0
+  if git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
+    read -r behind ahead < <(git rev-list --left-right --count @{u}...HEAD 2>/dev/null)
+  fi
+  # local branches with commits not on their remote
+  unpushed="$(git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads 2>/dev/null | grep -c 'ahead' )"
+
+  local line="${BOLD}$name${X} ${DIM}($branch)${X}"
+  printf "\n  %s\n" "$line"
+
+  # push access (only resolved when we might mutate or hand off)
+  local access="unknown" readonly_repo=0 pkgcount=0
+  if [ "$mode" = "out" ]; then
+    access="$(repo_push_access "$repo")"
+    [ "$access" = "false" ] && readonly_repo=1
+    pkgcount="$(git rev-list --count "$DEFAULT_BASE..HEAD" 2>/dev/null || echo 0)"
+  fi
+
+  if [ "$branch" != "main" ]; then
+    if [ "$readonly_repo" -eq 1 ]; then
+      info "  on '$branch' (read-only org repo → handoff branch; delivered as a changeset, not pushed)"
+    else
+      warn "  on '$branch', not main — finish or push before switching machines"
+    fi
+  fi
+
+  if [ "$dirty" -gt 0 ]; then
+    warn "  $dirty uncommitted change(s)"
+    [ "$mode" = "out" ] && info "  $(git status --short | head -5 | sed 's/^/      /')"
+  else
+    ok "  working tree clean"
+  fi
+
+  [ "${behind:-0}" -gt 0 ] && warn "  $behind commit(s) behind upstream"
+  if [ "$readonly_repo" -eq 0 ]; then
+    [ "${ahead:-0}" -gt 0 ]  && warn "  $ahead commit(s) ahead (unpushed)"
+    [ "${unpushed:-0}" -gt 1 ] && warn "  $unpushed local branch(es) have unpushed commits"
+  elif [ "${pkgcount:-0}" -gt 0 ]; then
+    info "  $pkgcount commit(s) vs $DEFAULT_BASE to hand off (not an error — read-only repo)"
+  fi
+
+  # worktree parity
+  local wt; wt="$(git worktree list 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$wt" -gt 1 ] && info "  $wt worktrees active: $(git worktree list | tail -n +2 | awk '{print $3}' | tr -d '[]' | paste -sd, -)"
+
+  # .env / secrets-template health
+  if [ -f "$TPL_DIR/$name.env.tpl" ]; then
+    [ -f .env ] && ok "  .env present (from template)" || warn "  template exists but no .env — run: machine-sync in"
+  else
+    [ -f .env ] && info "  .env present (no template yet — not 1Password-managed)" || warn "  no .env / template (scaffold to provision)"
+  fi
+
+  # actions
+  if [ "$mode" = "in" ] && [ "$dirty" -eq 0 ] && [ "${behind:-0}" -gt 0 ] && [ "${ahead:-0}" -eq 0 ]; then
+    if ask "  fast-forward $name ($behind behind)?"; then
+      git pull --ff-only --quiet && ok "  pulled" || bad "  pull failed"
+    fi
+  fi
+  if [ "$mode" = "out" ]; then
+    if [ "$readonly_repo" -eq 1 ]; then
+      # read-only org repo: never push. Route stranded branch work into a changeset for the maintainer.
+      if [ "$branch" != "main" ] && [ "${pkgcount:-0}" -gt 0 ]; then
+        if [ "$dirty" -gt 0 ]; then
+          warn "  commit your work first — the changeset is built from the committed branch"
+        elif ask "  package '$branch' as a changeset for the maintainer?"; then
+          if package_repo "$repo" "$branch"; then
+            ok "  changeset: $PKG_OUT"
+            info "  → send this single .md to the maintainer (no PR/push — repo is read-only)"
+          fi
+        else
+          info "  skipped — run later: machine-sync package $branch $repo"
+        fi
+      fi
+    else
+      # write access: unchanged push behavior
+      if [ "$dirty" -gt 0 ]; then
+        info "  commit manually, then re-run (won't auto-commit your work)"
+      elif [ "${ahead:-0}" -gt 0 ]; then
+        if ask "  push $name ($ahead ahead)?"; then
+          git push --quiet && ok "  pushed" || bad "  push failed"
+        fi
+      fi
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Secrets (1Password op inject)
+# ---------------------------------------------------------------------------
+secrets_sync() { # $1=mode
+  local mode="$1"
+  hdr "Secrets (1Password op inject)"
+  if ! have op; then bad "op CLI not installed (brew install --cask 1password-cli)"; return; fi
+  if ! op whoami >/dev/null 2>&1; then
+    warn "1Password CLI not signed in — enable: 1Password app → Settings → Developer → 'Integrate with CLI' (or run: eval \$(op signin))"; return
+  fi
+
+  local r name tpl had=0
+  while IFS= read -r r; do
+    name="$(basename "$r")"; tpl="$TPL_DIR/$name.env.tpl"
+    [ -f "$tpl" ] || continue
+    had=1
+    if [ "$mode" = "in" ]; then
+      # materialize .env from the committed template + 1Password (no secret value ever touches git)
+      if op inject -f -i "$tpl" -o "$r/.env" >/dev/null 2>&1; then
+        ok "$name/.env materialized from 1Password"
+      else
+        bad "$name: op inject failed — missing item/field? debug with: op inject -i $tpl"
+      fi
+    else
+      # .env is derived; flag any key present in .env but missing from the template
+      if [ -f "$r/.env" ]; then
+        local missing
+        missing="$(comm -23 \
+          <(grep -oE '^[A-Z][A-Z0-9_]+' "$r/.env" 2>/dev/null | sort -u) \
+          <(grep -oE '^[A-Z][A-Z0-9_]+' "$tpl"     2>/dev/null | sort -u) | tr '\n' ' ')"
+        [ -n "$missing" ] && warn "$name: key(s) in .env not in .env.tpl — add to 1Password + template: $missing" \
+                          || ok "$name: .env fully tracked by template"
+      fi
+    fi
+  done < <(list_repos)
+  [ "$had" -eq 0 ] && info "no templates in $TPL_DIR yet — scaffold per repo (see BOOTSTRAP.md)"
+}
+
+# ---------------------------------------------------------------------------
+# Dotfiles
+# ---------------------------------------------------------------------------
+dotfiles_sync() { # $1=mode
+  local mode="$1"
+  hdr "Dotfiles"
+  [ -d "$DOTFILES_DIR/.git" ] || { warn "$DOTFILES_DIR not tracked yet"; return; }
+  cd "$DOTFILES_DIR" || return
+  if [ "$mode" = "in" ]; then
+    git fetch --quiet 2>/dev/null
+    local behind; behind="$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)"
+    [ "${behind:-0}" -gt 0 ] && { git pull --ff-only --quiet && ok "pulled $behind dotfile update(s)"; } || ok "dotfiles up to date"
+  else
+    if [ -n "$(git status --porcelain)" ]; then
+      git status --short | sed 's/^/      /'
+      ask "commit + push dotfile changes?" && { git add -A && git commit -q -m "dotfiles: sync $(hostname -s)" && git push --quiet && ok "dotfiles pushed"; }
+    else
+      ok "no dotfile changes"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Tool versions
+# ---------------------------------------------------------------------------
+versions_check() {
+  hdr "Tool versions"
+  if [ ! -f "$VERSION_LOCK" ]; then
+    info "no pin file ($VERSION_LOCK) — writing current as the baseline"
+    { echo "node $(node -v 2>/dev/null)"; echo "npm $(npm -v 2>/dev/null)"; } > "$VERSION_LOCK" 2>/dev/null && ok "wrote baseline (commit it in dotfiles)"
+    return
+  fi
+  local tool want have_v
+  while read -r tool want; do
+    [ -z "$tool" ] && continue
+    case "$tool" in
+      node) have_v="$(node -v 2>/dev/null)";;
+      npm)  have_v="v$(npm -v 2>/dev/null)";;
+      *) continue;;
+    esac
+    [ "$have_v" = "$want" ] && ok "$tool $have_v" || warn "$tool $have_v on this machine, pinned $want — align them"
+  done < "$VERSION_LOCK"
+}
+
+# ---------------------------------------------------------------------------
+# Cron parity
+# ---------------------------------------------------------------------------
+cron_check() {
+  hdr "Cron / scheduled-audit parity"
+  local live; live="$(crontab -l 2>/dev/null | grep -vE '^\s*#|^\s*$')"
+  if [ ! -f "$CRON_TRACKED" ]; then
+    info "no tracked crontab ($CRON_TRACKED)"
+    [ -n "$live" ] && info "this machine has live cron entries — snapshot with: crontab -l > $CRON_TRACKED"
+    return
+  fi
+  local tracked; tracked="$(grep -vE '^\s*#|^\s*$' "$CRON_TRACKED" 2>/dev/null)"
+  if [ "$live" = "$tracked" ]; then ok "crontab matches tracked manifest"
+  else warn "crontab DIFFERS from tracked manifest:"; diff <(echo "$tracked") <(echo "$live") | sed 's/^/      /'; fi
+}
+
+# ---------------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------------
+summary() {
+  hdr "Summary"
+  if [ "$WARN_COUNT" -eq 0 ]; then printf "  ${G}${BOLD}All clear.${X}\n\n"
+  else printf "  ${Y}${BOLD}%d item(s) need attention${X} (see ${Y}!${X}/${R}✗${X} above)\n\n" "$WARN_COUNT"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Handoff packaging — one self-contained markdown changeset for the maintainer's agent.
+# Built from the COMMITTED branch (git -C show), never the working tree, and
+# always pinned to an absolute repo path (no reliance on the shell's CWD).
+# ---------------------------------------------------------------------------
+PKG_OUT=""
+package_repo() { # $1=repo abs, $2=branch ; sets global PKG_OUT to the .md path
+  local repo="$1" branch="$2" base="$DEFAULT_BASE"
+  PKG_OUT=""
+  local name slug; name="$(basename "$repo")"; slug="$(slugify "$branch")"
+
+  if ! git -C "$repo" rev-parse --verify --quiet "$branch^{commit}" >/dev/null; then
+    bad "  branch '$branch' not found in $name"; return 1
+  fi
+  git -C "$repo" fetch origin main --quiet 2>/dev/null
+  if ! git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    bad "  base '$base' not found — is origin set / fetched?"; return 1
+  fi
+
+  local nstat; nstat="$(git -C "$repo" diff --no-renames --name-status "$base"..."$branch" 2>/dev/null)"
+  if [ -z "$nstat" ]; then
+    warn "  '$branch' has no changes vs $base — nothing to package"; return 1
+  fi
+
+  local ncommits org_slug pr_title commit_msg verify
+  ncommits="$(git -C "$repo" rev-list --count "$base".."$branch" 2>/dev/null || echo 0)"
+  org_slug="$(repo_origin_slug "$repo")"
+  pr_title="$(git -C "$repo" log -1 --format='%s' "$branch" 2>/dev/null)"
+  if [ "${ncommits:-0}" -le 1 ]; then
+    commit_msg="$(git -C "$repo" log -1 --format='%B' "$branch")"
+  else
+    commit_msg="$pr_title"$'\n\n'"Squashed from $ncommits commits:"$'\n'"$(git -C "$repo" log --reverse --format='- %s' "$base".."$branch")"
+  fi
+  if git -C "$repo" show "$branch:package.json" >/dev/null 2>&1; then
+    verify='npm ci && npm test'
+  else
+    verify="Run ${name}'s test/build suite per its conventions."
+  fi
+
+  mkdir -p "$OUTBOX_DIR/$slug"
+  local out="$OUTBOX_DIR/$slug/$slug-changeset.md"
+
+  {
+    printf '# Changeset: %s\n\n' "$slug"
+    printf '> Self-contained handoff for the **maintainer** — recreate in `%s`.\n' "${org_slug:-$name}"
+    printf '> Branch `%s` · %s commit(s) vs `%s`. Delivered as ONE markdown file\n' "$branch" "$ncommits" "$base"
+    printf '> (read-only org repo: no PR/push, no .patch/.bundle — re-apply by hand).\n\n'
+
+    printf '## PR title\n\n%s\n\n' "$pr_title"
+    printf '## Commit message\n\n~~~~~\n%s\n~~~~~\n\n' "$commit_msg"
+
+    printf '## How to apply (receiving Claude)\n\n'
+    printf '1. In `%s`, refresh main: `git fetch origin main`\n' "${org_slug:-$name}"
+    printf '2. Branch off main: `git checkout -b %s origin/main`\n' "$branch"
+    printf '3. Create each **NEW file** verbatim (the `~~~~~` lines are fence delimiters — do not write them into the file).\n'
+    printf '4. For each **MODIFIED file**, apply the additive snippet: `+` lines are new; context lines already exist there.\n'
+    printf '5. Delete any files listed in the Deleted section.\n'
+    printf '6. Verify: `%s`\n' "$verify"
+    printf '7. Commit with the message above; open a PR with the PR title above.\n\n'
+
+    local printed st path addcol
+
+    printed=0
+    while IFS=$'\t' read -r st path; do
+      [ "$st" = "A" ] || continue
+      [ "$printed" -eq 0 ] && { printf '## New files (full contents)\n\n'; printed=1; }
+      printf '### `%s` — NEW\n\n' "$path"
+      read -r addcol _ < <(git -C "$repo" diff --no-renames --numstat "$base"..."$branch" -- "$path")
+      if [ "$addcol" = "-" ]; then
+        printf '_[binary file — transfer separately (AirDrop / attachment)]_\n\n'
+      else
+        printf '~~~~~\n'; git -C "$repo" show "$branch:$path"; printf '\n~~~~~\n\n'
+      fi
+    done <<< "$nstat"
+
+    printed=0
+    while IFS=$'\t' read -r st path; do
+      case "$st" in M|T) ;; *) continue ;; esac
+      [ "$printed" -eq 0 ] && { printf '## Modified files (additive snippets)\n\n'; printed=1; }
+      printf '### `%s` — MODIFIED\n\n' "$path"
+      printf 'Apply these changes (context unchanged; `+` add, `-` remove):\n\n'
+      printf '~~~~~diff\n'; git -C "$repo" diff --no-renames "$base"..."$branch" -- "$path"; printf '\n~~~~~\n\n'
+    done <<< "$nstat"
+
+    printed=0
+    while IFS=$'\t' read -r st path; do
+      [ "$st" = "D" ] || continue
+      [ "$printed" -eq 0 ] && { printf '## Deleted files\n\nDelete each of these:\n\n'; printed=1; }
+      printf -- '- `%s`\n' "$path"
+    done <<< "$nstat"
+    [ "$printed" -eq 1 ] && printf '\n'
+  } > "$out"
+
+  PKG_OUT="$out"
+  return 0
+}
+
+pkg_cmd() { # [branch] [repo]
+  local branch="${1:-}" repo="${2:-}"
+  [ -z "$repo" ] && repo="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$repo" ] || { [ ! -d "$repo/.git" ] && [ ! -f "$repo/.git" ]; }; then
+    bad "not in a git repo — usage: machine-sync package <branch> [repo-path]"; return 1
+  fi
+  [ -z "$branch" ] && branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  printf "${BOLD}machine-sync package${X}  ${DIM}— %s · %s${X}\n" "$(basename "$repo")" "$branch"
+  outbox_prune
+  if package_repo "$repo" "$branch"; then
+    hdr "Changeset ready"
+    ok "$PKG_OUT"
+    local access; access="$(repo_push_access "$repo")"
+    [ "$access" = "true" ] && info "(You DO have push access here — a normal PR also works. Packaged anyway.)"
+    info "Send this single .md to the maintainer; their agent re-applies it (no PR/patch/bundle)."
+  else
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+run_repos() { local mode="$1"; hdr "Repositories"; while IFS= read -r r; do repo_report "$r" "$mode"; done < <(list_repos); }
+
+usage() {
+  cat <<EOF
+machine-sync — keep two Macs in lockstep + package read-only org work as a changeset for a reviewer.
+
+  machine-sync in                       Arrival: op inject .env, pull code, surface drift.
+  machine-sync out                      Departure: push where allowed; package read-only org work.
+  machine-sync status                   Read-only health check.
+  machine-sync doctor                   Verify tooling/repos are bootstrapped.
+  machine-sync package <branch> [repo]  Emit one <slug>-changeset.md handoff.
+                                        Defaults: repo = current dir, branch = current branch.
+                                        Output: $OUTBOX_DIR/<slug>/<slug>-changeset.md
+  machine-sync help                     This text.
+EOF
+}
+
+case "${1:-status}" in
+  in)
+    printf "${BOLD}machine-sync in${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
+    secrets_sync in; dotfiles_sync in; run_repos in; versions_check; cron_check; summary ;;
+  out)
+    printf "${BOLD}machine-sync out${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
+    outbox_prune; run_repos out; secrets_sync out; dotfiles_sync out; cron_check; summary ;;
+  status)
+    printf "${BOLD}machine-sync status${X}  ${DIM}— $(hostname -s)${X}\n"
+    run_repos status; versions_check; cron_check; summary ;;
+  doctor) cmd_doctor ;;
+  package|handoff) shift; pkg_cmd "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage ;;
+esac

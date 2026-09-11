@@ -1,0 +1,7 @@
+# never track real secrets or machine-local keys
+*.key
+home/.claude/.credentials*
+home/.ssh/
+# changesets / handoff packages (may contain unmerged work)
+outbox/
+.DS_Store
