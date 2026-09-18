@@ -25,6 +25,9 @@
 # Never prints secret VALUES. Never force-pushes. Always prompts before mutating remotes.
 
 set -uo pipefail
+# Stable per-machine name for host pins and commit messages. `hostname -s` follows the current
+# network on a mobile Mac (seen flipping between two names on the satellite); LocalHostName does not.
+host_name() { scutil --get LocalHostName 2>/dev/null || hostname -s; }
 
 # ---------------------------------------------------------------------------
 # Config (override via env)
@@ -107,7 +110,7 @@ agent_hosts() { # $1=label -> comma list of hosts allowed to run it ("" = every 
 agent_wanted_here() { # $1=label -> 0 if this host should run the agent
   local hosts; hosts="$(agent_hosts "$1")"
   [ -z "$hosts" ] && return 0
-  case ",$hosts," in *",$(hostname -s),"*) return 0 ;; *) return 1 ;; esac
+  case ",$hosts," in *",$(host_name),"*) return 0 ;; *) return 1 ;; esac
 }
 
 outbox_prune() { # drop changeset dirs older than the retention window
@@ -356,7 +359,7 @@ dotfiles_sync() { # $1=mode
   else
     if [ -n "$(git status --porcelain)" ]; then
       git status --short | sed 's/^/      /'
-      ask "commit + push dotfile changes?" && { git add -A && git commit -q -m "dotfiles: sync $(hostname -s)" && git push --quiet && ok "dotfiles pushed"; }
+      ask "commit + push dotfile changes?" && { git add -A && git commit -q -m "dotfiles: sync $(host_name)" && git push --quiet && ok "dotfiles pushed"; }
     else
       ok "no dotfile changes"
     fi
@@ -402,7 +405,7 @@ sched_check() { # $1=mode
     any=1; label="$(basename "$p" .plist)"; live="$LAUNCHD_LIVE/$label.plist"
     if ! agent_wanted_here "$label"; then
       if [ -f "$live" ] || grep -qx "$label" <<<"$loaded"; then
-        warn "$label: pinned to $(agent_hosts "$label") but present on $(hostname -s) — launchctl bootout gui/$uid \"$live\" && rm \"$live\""
+        warn "$label: pinned to $(agent_hosts "$label") but present on $(host_name) — launchctl bootout gui/$uid \"$live\" && rm \"$live\""
       else
         info "$label: hub-only ($(agent_hosts "$label")) — correctly absent here"
       fi
@@ -605,13 +608,13 @@ EOF
 
 case "${1:-status}" in
   in)
-    printf "${BOLD}machine-sync in${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
+    printf "${BOLD}machine-sync in${X}  ${DIM}— $(host_name) @ $(date '+%H:%M')${X}\n"
     secrets_sync in; dotfiles_sync in; run_repos in; versions_check; sched_check in; summary ;;
   out)
-    printf "${BOLD}machine-sync out${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
+    printf "${BOLD}machine-sync out${X}  ${DIM}— $(host_name) @ $(date '+%H:%M')${X}\n"
     outbox_prune; run_repos out; secrets_sync out; dotfiles_sync out; sched_check out; summary ;;
   status)
-    printf "${BOLD}machine-sync status${X}  ${DIM}— $(hostname -s)${X}\n"
+    printf "${BOLD}machine-sync status${X}  ${DIM}— $(host_name)${X}\n"
     run_repos status; secrets_sync status; versions_check; sched_check status; summary ;;
   doctor) cmd_doctor ;;
   package|handoff) shift; pkg_cmd "$@" ;;
