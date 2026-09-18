@@ -1,0 +1,4 @@
+# Pin a tracked launchd agent (home/Library/LaunchAgents/<label>.plist) to specific host(s).
+# Format: <label> <host1[,host2]>  (hostname -s). Unlisted agents are expected on every machine;
+# a pinned agent found on any other host is flagged so hub-only jobs never double-run.
+# com.example.nightly-collector my-desktop

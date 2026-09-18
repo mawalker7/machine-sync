@@ -11,11 +11,16 @@
 # Design: git is the source of truth for code. This tool enforces push-before-you-leave
 # discipline and handles the things git does NOT carry across machines:
 #   - secrets (.env) materialized from 1Password via `op inject` on a committed .env.tpl
-#   - dotfiles (~/.zshrc, ~/.gitconfig, ~/.claude/settings.json) via a tracked dotfiles repo
+#     (template must stay key-identical to the repo's .env.example — drift is reported)
+#   - dotfiles (~/.claude/settings.json, ~/.claude/CLAUDE.md, ~/.config/*) via a tracked dotfiles repo
+#   - launchd agents: tracked plists (home/Library/LaunchAgents, `__HOME__` token) are rendered,
+#     installed and loaded per host; env-manifest/launchd-hosts.txt pins hub-only jobs to one Mac
 #   - tool versions (node, npm) checked against a pinned manifest
-#   - worktree + cron parity reports
-#   - handoff packaging: read-only org repos (where your account cannot push or open PRs) are
-#     delivered to the maintainer as ONE markdown changeset their agent can re-apply — no PR/patch/bundle.
+#   - worktree parity (open vs already-merged → prune candidates) + legacy cron parity
+#   - handoff packaging: repos where this account lacks push access (detected live via `gh api`)
+#     are delivered to the maintainer as ONE markdown changeset their agent can re-apply — no PR/patch/bundle.
+#     (if your account later gains write access on an org repo, it simply starts to
+#     push + PR normally; packaging stays as the fallback for any repo that answers push=false.)
 #
 # Never prints secret VALUES. Never force-pushes. Always prompts before mutating remotes.
 
@@ -29,6 +34,11 @@ DOTFILES_DIR="${MACHINE_SYNC_DOTFILES_DIR:-$HOME/.dotfiles}"
 TPL_DIR="${MACHINE_SYNC_TPL_DIR:-$DOTFILES_DIR/env-templates}"
 VERSION_LOCK="${MACHINE_SYNC_VERSION_LOCK:-$DOTFILES_DIR/env-manifest/versions.lock}"
 CRON_TRACKED="${MACHINE_SYNC_CRON:-$DOTFILES_DIR/cron/crontab.txt}"
+NO_ENV_LIST="${MACHINE_SYNC_NO_ENV_LIST:-$DOTFILES_DIR/env-manifest/no-env-repos.txt}"
+LAUNCHD_TRACKED="${MACHINE_SYNC_LAUNCHD_DIR:-$DOTFILES_DIR/home/Library/LaunchAgents}"
+LAUNCHD_LIVE="$HOME/Library/LaunchAgents"
+LAUNCHD_HOSTS="${MACHINE_SYNC_LAUNCHD_HOSTS:-$DOTFILES_DIR/env-manifest/launchd-hosts.txt}"
+LAUNCHD_PREFIXES="${MACHINE_SYNC_LAUNCHD_PREFIXES:-com.example.}"
 OUTBOX_DIR="${MACHINE_SYNC_OUTBOX:-$DOTFILES_DIR/outbox}"
 OUTBOX_PRUNE_DAYS="${MACHINE_SYNC_OUTBOX_PRUNE_DAYS:-14}"
 DEFAULT_BASE="${MACHINE_SYNC_BASE:-origin/main}"
@@ -48,7 +58,8 @@ bad()   { printf "  ${R}✗${X} %s\n" "$1"; WARN_COUNT=$((WARN_COUNT+1)); }
 info()  { printf "  ${DIM}%s${X}\n" "$1"; }
 hdr()   { printf "\n${BOLD}${B}== %s ==${X}\n" "$1"; }
 ask()   { # ask "prompt" -> returns 0 on yes
-  local reply; printf "  ${Y}?${X} %s [y/N] " "$1"; read -r reply </dev/tty 2>/dev/null || return 1
+  local reply; printf "  ${Y}?${X} %s [y/N] " "$1"
+  { read -r reply </dev/tty; } 2>/dev/null || { printf "%s\n" "(no terminal — skipped)"; return 1; }
   [[ "$reply" =~ ^[Yy] ]]
 }
 
@@ -76,6 +87,27 @@ repo_push_access() { # $1=repo abs -> true | false | unknown
     false) echo false ;;
     *)     echo unknown ;;
   esac
+}
+
+env_keys() { grep -oE '^[A-Z][A-Z0-9_]+' "$1" 2>/dev/null | sort -u; }
+
+env_optout() { # $1=repo name -> 0 if the repo is listed as intentionally unprovisioned on this machine
+  [ -f "$NO_ENV_LIST" ] && grep -vE '^\s*#|^\s*$' "$NO_ENV_LIST" | grep -qx "$1"
+}
+
+# Tracked plists carry a literal `__HOME__` so the same file installs under any user
+# (each Mac may have a different login). Rendering = substitute the current $HOME.
+render_plist() { sed "s#__HOME__#$HOME#g" "$1"; }
+
+agent_hosts() { # $1=label -> comma list of hosts allowed to run it ("" = every host)
+  [ -f "$LAUNCHD_HOSTS" ] || return 0
+  awk -v l="$1" '$1==l {print $2}' "$LAUNCHD_HOSTS" | head -1
+}
+
+agent_wanted_here() { # $1=label -> 0 if this host should run the agent
+  local hosts; hosts="$(agent_hosts "$1")"
+  [ -z "$hosts" ] && return 0
+  case ",$hosts," in *",$(hostname -s),"*) return 0 ;; *) return 1 ;; esac
 }
 
 outbox_prune() { # drop changeset dirs older than the retention window
@@ -133,8 +165,11 @@ repo_report() { # $1=repo path, $2=mode(in|out|status)
 
   git fetch --all --prune --quiet 2>/dev/null
 
-  local branch ahead behind dirty unpushed
+  local branch ahead behind dirty unpushed default_branch
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  # the remote's default branch, not a literal "main" (falls back to main when origin/HEAD is unset)
+  default_branch="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  default_branch="${default_branch:-main}"
   dirty="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 
   # ahead/behind vs upstream (if tracking)
@@ -142,8 +177,9 @@ repo_report() { # $1=repo path, $2=mode(in|out|status)
   if git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
     read -r behind ahead < <(git rev-list --left-right --count @{u}...HEAD 2>/dev/null)
   fi
-  # local branches with commits not on their remote
-  unpushed="$(git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads 2>/dev/null | grep -c 'ahead' )"
+  # OTHER local branches with commits not on their remote (the checked-out branch is covered by $ahead)
+  unpushed="$(git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads 2>/dev/null \
+    | grep 'ahead' | awk -v cur="$branch" '$1!=cur {print $1}' | paste -sd, -)"
 
   local line="${BOLD}$name${X} ${DIM}($branch)${X}"
   printf "\n  %s\n" "$line"
@@ -156,11 +192,11 @@ repo_report() { # $1=repo path, $2=mode(in|out|status)
     pkgcount="$(git rev-list --count "$DEFAULT_BASE..HEAD" 2>/dev/null || echo 0)"
   fi
 
-  if [ "$branch" != "main" ]; then
+  if [ "$branch" != "$default_branch" ]; then
     if [ "$readonly_repo" -eq 1 ]; then
       info "  on '$branch' (read-only org repo → handoff branch; delivered as a changeset, not pushed)"
     else
-      warn "  on '$branch', not main — finish or push before switching machines"
+      warn "  on '$branch', not $default_branch — finish or push before switching machines"
     fi
   fi
 
@@ -174,25 +210,48 @@ repo_report() { # $1=repo path, $2=mode(in|out|status)
   [ "${behind:-0}" -gt 0 ] && warn "  $behind commit(s) behind upstream"
   if [ "$readonly_repo" -eq 0 ]; then
     [ "${ahead:-0}" -gt 0 ]  && warn "  $ahead commit(s) ahead (unpushed)"
-    [ "${unpushed:-0}" -gt 1 ] && warn "  $unpushed local branch(es) have unpushed commits"
+    [ -n "$unpushed" ] && warn "  unpushed commits on other local branch(es): $unpushed"
   elif [ "${pkgcount:-0}" -gt 0 ]; then
     info "  $pkgcount commit(s) vs $DEFAULT_BASE to hand off (not an error — read-only repo)"
   fi
 
-  # worktree parity
-  local wt; wt="$(git worktree list 2>/dev/null | wc -l | tr -d ' ')"
-  [ "$wt" -gt 1 ] && info "  $wt worktrees active: $(git worktree list | tail -n +2 | awk '{print $3}' | tr -d '[]' | paste -sd, -)"
+  # worktree parity — split into still-open vs already merged into $DEFAULT_BASE (prune candidates)
+  local wt_total wt_detached wt_open="" wt_merged="" b
+  wt_total="$(git worktree list --porcelain 2>/dev/null | grep -c '^worktree ')"
+  if [ "${wt_total:-0}" -gt 1 ]; then
+    wt_detached="$(git worktree list --porcelain 2>/dev/null | grep -c '^detached$')"
+    while IFS= read -r b; do
+      [ "$b" = "$branch" ] && continue   # the primary checkout itself
+      if git merge-base --is-ancestor "$b" "$DEFAULT_BASE" 2>/dev/null; then wt_merged="$wt_merged,$b"; else wt_open="$wt_open,$b"; fi
+    done < <(git worktree list --porcelain 2>/dev/null | awk '/^branch /{sub("refs/heads/","",$2); print $2}')
+    info "  $wt_total worktrees${wt_detached:+ ($wt_detached detached)}${wt_open:+ — open: ${wt_open#,}}"
+    [ -n "$wt_merged" ] && warn "  worktrees already merged into $DEFAULT_BASE (prune: git worktree remove <path> && git branch -d <branch>): ${wt_merged#,}"
+  fi
 
   # .env / secrets-template health
   if [ -f "$TPL_DIR/$name.env.tpl" ]; then
     [ -f .env ] && ok "  .env present (from template)" || warn "  template exists but no .env — run: machine-sync in"
+  elif env_optout "$name"; then
+    info "  .env intentionally not provisioned on this machine (listed in $(basename "$NO_ENV_LIST"))"
+  elif [ ! -f .env.example ]; then
+    :   # repo declares no env contract — nothing to provision, nothing to report
   else
     [ -f .env ] && info "  .env present (no template yet — not 1Password-managed)" || warn "  no .env / template (scaffold to provision)"
   fi
 
   # actions
-  if [ "$mode" = "in" ] && [ "$dirty" -eq 0 ] && [ "${behind:-0}" -gt 0 ] && [ "${ahead:-0}" -eq 0 ]; then
-    if ask "  fast-forward $name ($behind behind)?"; then
+  if [ "$mode" = "in" ] && [ "${behind:-0}" -gt 0 ] && [ "${ahead:-0}" -eq 0 ]; then
+    # a ff-only pull is safe with a dirty tree as long as no dirty path is also touched upstream
+    local blocked="" note=""
+    if [ "$dirty" -gt 0 ]; then
+      blocked="$(comm -12 \
+        <(git status --porcelain 2>/dev/null | sed -E 's/^.{3}//; s/.* -> //' | sort -u) \
+        <(git diff --name-only HEAD @{u} 2>/dev/null | sort -u) | paste -sd' ' -)"
+      note=", dirty files untouched upstream"
+    fi
+    if [ -n "$blocked" ]; then
+      warn "  pull blocked — dirty file(s) also changed upstream (commit, stash, or discard them): $blocked"
+    elif ask "  fast-forward $name ($behind behind$note)?"; then
       git pull --ff-only --quiet && ok "  pulled" || bad "  pull failed"
     fi
   fi
@@ -230,9 +289,11 @@ repo_report() { # $1=repo path, $2=mode(in|out|status)
 secrets_sync() { # $1=mode
   local mode="$1"
   hdr "Secrets (1Password op inject)"
-  if ! have op; then bad "op CLI not installed (brew install --cask 1password-cli)"; return; fi
-  if ! op whoami >/dev/null 2>&1; then
-    warn "1Password CLI not signed in — enable: 1Password app → Settings → Developer → 'Integrate with CLI' (or run: eval \$(op signin))"; return
+  if [ "$mode" = "in" ]; then   # only materializing needs the CLI; drift checks are pure file compares
+    if ! have op; then bad "op CLI not installed (brew install --cask 1password-cli)"; return; fi
+    if ! op whoami >/dev/null 2>&1; then
+      warn "1Password CLI not signed in — enable: 1Password app → Settings → Developer → 'Integrate with CLI' (or run: eval \$(op signin))"; return
+    fi
   fi
 
   local r name tpl had=0
@@ -247,19 +308,27 @@ secrets_sync() { # $1=mode
       else
         bad "$name: op inject failed — missing item/field? debug with: op inject -i $tpl"
       fi
-    else
-      # .env is derived; flag any key present in .env but missing from the template
-      if [ -f "$r/.env" ]; then
-        local missing
-        missing="$(comm -23 \
-          <(grep -oE '^[A-Z][A-Z0-9_]+' "$r/.env" 2>/dev/null | sort -u) \
-          <(grep -oE '^[A-Z][A-Z0-9_]+' "$tpl"     2>/dev/null | sort -u) | tr '\n' ' ')"
-        [ -n "$missing" ] && warn "$name: key(s) in .env not in .env.tpl — add to 1Password + template: $missing" \
-                          || ok "$name: .env fully tracked by template"
-      fi
     fi
+    tpl_drift "$r" "$tpl"
   done < <(list_repos)
   [ "$had" -eq 0 ] && info "no templates in $TPL_DIR yet — scaffold per repo (see BOOTSTRAP.md)"
+}
+
+# The generated .env is only as complete as the template, so drift is measured against the
+# repo's committed .env.example (the contract), never against .env (which is derived from the template).
+tpl_drift() { # $1=repo abs, $2=template path
+  local name ex missing extra n; name="$(basename "$1")"; ex="$1/.env.example"
+  [ -f "$ex" ] || return 0
+  missing="$(comm -23 <(env_keys "$ex") <(env_keys "$2") | paste -sd' ' -)"
+  extra="$(comm -13 <(env_keys "$ex") <(env_keys "$2") | paste -sd' ' -)"
+  if [ -z "$missing" ] && [ -z "$extra" ]; then ok "$name: template key-identical to .env.example"; return 0; fi
+  if [ -n "$missing" ]; then
+    n="$(wc -w <<<"$missing" | tr -d ' ')"
+    warn "$name: $n key(s) in .env.example missing from the template (generated .env lacks them): $(cut -d' ' -f1-8 <<<"$missing")$([ "$n" -gt 8 ] && echo " … +$((n-8)) more")"
+    info "  fix: copy the new lines from $ex into $2 (secrets → op:// refs, config → literal)"
+  fi
+  [ -n "$extra" ] && warn "$name: key(s) in template no longer in .env.example: $extra"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -272,8 +341,18 @@ dotfiles_sync() { # $1=mode
   cd "$DOTFILES_DIR" || return
   if [ "$mode" = "in" ]; then
     git fetch --quiet 2>/dev/null
-    local behind; behind="$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)"
-    [ "${behind:-0}" -gt 0 ] && { git pull --ff-only --quiet && ok "pulled $behind dotfile update(s)"; } || ok "dotfiles up to date"
+    local behind dd; behind="$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)"
+    if [ "${behind:-0}" -gt 0 ]; then
+      git pull --ff-only --quiet && ok "pulled $behind dotfile update(s)" || bad "dotfiles pull failed — local edits in the way? see below"
+    else
+      ok "dotfiles up to date with remote"
+    fi
+    # local edits that have not left this Mac yet (the other machine cannot see them until `out` pushes)
+    dd="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${dd:-0}" -gt 0 ]; then
+      warn "$dd uncommitted dotfile change(s) — only on this Mac until: machine-sync out"
+      git status --short | sed 's/^/      /'
+    fi
   else
     if [ -n "$(git status --porcelain)" ]; then
       git status --short | sed 's/^/      /'
@@ -307,14 +386,70 @@ versions_check() {
 }
 
 # ---------------------------------------------------------------------------
-# Cron parity
+# Scheduled jobs — launchd parity (the real scheduler on both Macs) + legacy cron
 # ---------------------------------------------------------------------------
-cron_check() {
-  hdr "Cron / scheduled-audit parity"
+# Tracked plist (with __HOME__) is the SSOT. Per host: rendered copy must be installed,
+# identical, and loaded — unless env-manifest/launchd-hosts.txt pins the job elsewhere,
+# in which case its presence here is the defect (hub-only jobs must not double-run).
+sched_check() { # $1=mode
+  local mode="$1"
+  hdr "Scheduled jobs (launchd parity)"
+  local p label live loaded pre uid; uid="$(id -u)"
+  loaded="$(launchctl list 2>/dev/null | awk '{print $3}')"
+  local any=0
+  for p in "$LAUNCHD_TRACKED"/*.plist; do
+    [ -f "$p" ] || continue
+    any=1; label="$(basename "$p" .plist)"; live="$LAUNCHD_LIVE/$label.plist"
+    if ! agent_wanted_here "$label"; then
+      if [ -f "$live" ] || grep -qx "$label" <<<"$loaded"; then
+        warn "$label: pinned to $(agent_hosts "$label") but present on $(hostname -s) — launchctl bootout gui/$uid \"$live\" && rm \"$live\""
+      else
+        info "$label: hub-only ($(agent_hosts "$label")) — correctly absent here"
+      fi
+      continue
+    fi
+    local state="" differs=0
+    if [ ! -f "$live" ]; then state="not installed"
+    elif ! diff -q <(render_plist "$p") "$live" >/dev/null 2>&1; then state="live plist differs from tracked copy"; differs=1
+    elif ! grep -qx "$label" <<<"$loaded"; then state="installed but not loaded"
+    fi
+    if [ -z "$state" ]; then ok "$label: installed, identical, loaded"; continue; fi
+    if [ "$differs" -eq 1 ]; then
+      # Either side can be the newer one: a job's own thread may have edited the live plist.
+      # Show the difference and the reverse command so the tracked copy is never assumed correct.
+      warn "$label: $state (tracked $(date -r "$p" '+%m-%d %H:%M') · live $(date -r "$live" '+%m-%d %H:%M'))"
+      diff <(render_plist "$p") "$live" | sed 's/^/        /' | head -20
+      info "  live is newer? adopt it: sed \"s#\$HOME#__HOME__#g\" \"$live\" > \"$p\""
+    fi
+    if [ "$mode" = "in" ] && ask "$label: overwrite the LIVE plist with the tracked copy?"; then
+      launchctl bootout "gui/$uid" "$live" >/dev/null 2>&1
+      render_plist "$p" > "$live" && launchctl bootstrap "gui/$uid" "$live" \
+        && ok "$label: installed + loaded" || bad "$label: install failed — launchctl print gui/$uid/$label"
+    elif [ "$differs" -eq 0 ]; then
+      warn "$label: $state — run: machine-sync in (renders __HOME__ → $HOME, then launchctl bootstrap)"
+    fi
+  done
+  # live personal agents that nobody tracks cannot reach the other Mac
+  for p in "$LAUNCHD_LIVE"/*.plist; do
+    [ -f "$p" ] || continue
+    label="$(basename "$p" .plist)"
+    for pre in $LAUNCHD_PREFIXES; do
+      case "$label" in "$pre"*)
+        [ -f "$LAUNCHD_TRACKED/$label.plist" ] \
+          || warn "$label: live here but not tracked — sed \"s#$HOME#__HOME__#g\" \"$p\" > \"$LAUNCHD_TRACKED/$label.plist\"" ;;
+      esac
+    done
+  done
+  [ "$any" -eq 0 ] && info "no tracked launchd agents in $LAUNCHD_TRACKED"
+
+  cron_check
+}
+
+cron_check() { # legacy — only speaks up when something actually uses cron
   local live; live="$(crontab -l 2>/dev/null | grep -vE '^\s*#|^\s*$')"
   if [ ! -f "$CRON_TRACKED" ]; then
-    info "no tracked crontab ($CRON_TRACKED)"
-    [ -n "$live" ] && info "this machine has live cron entries — snapshot with: crontab -l > $CRON_TRACKED"
+    [ -n "$live" ] && warn "live cron entries not tracked — snapshot with: crontab -l > $CRON_TRACKED" \
+                   || info "no crontab on this machine (launchd is the scheduler)"
     return
   fi
   local tracked; tracked="$(grep -vE '^\s*#|^\s*$' "$CRON_TRACKED" 2>/dev/null)"
@@ -471,13 +606,13 @@ EOF
 case "${1:-status}" in
   in)
     printf "${BOLD}machine-sync in${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
-    secrets_sync in; dotfiles_sync in; run_repos in; versions_check; cron_check; summary ;;
+    secrets_sync in; dotfiles_sync in; run_repos in; versions_check; sched_check in; summary ;;
   out)
     printf "${BOLD}machine-sync out${X}  ${DIM}— $(hostname -s) @ $(date '+%H:%M')${X}\n"
-    outbox_prune; run_repos out; secrets_sync out; dotfiles_sync out; cron_check; summary ;;
+    outbox_prune; run_repos out; secrets_sync out; dotfiles_sync out; sched_check out; summary ;;
   status)
     printf "${BOLD}machine-sync status${X}  ${DIM}— $(hostname -s)${X}\n"
-    run_repos status; versions_check; cron_check; summary ;;
+    run_repos status; secrets_sync status; versions_check; sched_check status; summary ;;
   doctor) cmd_doctor ;;
   package|handoff) shift; pkg_cmd "$@" ;;
   help|-h|--help) usage ;;

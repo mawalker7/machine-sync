@@ -1,0 +1,2 @@
+# Repos that have a .env.example but are intentionally NOT provisioned with a .env on this
+# machine (e.g. they run on another host). Reported as info instead of a warning. One name per line.
